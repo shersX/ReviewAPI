@@ -81,8 +81,7 @@ FIXED_AUDIT_RULES = [
 
 # 请求模型
 class AuditRequest(BaseModel):
-    single_url: Optional[HttpUrl] = None
-    batch_urls: Optional[List[HttpUrl]] = None
+    urls:List[HttpUrl]
     callback_url: Optional[HttpUrl] = None
 
 # 响应模型
@@ -364,38 +363,17 @@ async def process_batch_async(batch_id: str, urls: List[HttpUrl], callback_url: 
 async def audit_endpoint(request: AuditRequest):
     """统一PDF审查端点"""
     # 确定要处理的URL列表
-    urls = []
-    
-    if request.batch_urls:
-        urls = request.batch_urls
-        if len(urls) > 50:
-            raise HTTPException(status_code=400, detail="单次批量请求最多支持50个URL")
-    elif request.single_url:
-        urls = [request.single_url]
-    else:
-        raise HTTPException(status_code=400, detail="没有提供有效的PDF URL")
+    urls = request.urls
+    if not urls:
+        raise HTTPException(status_code=400, detail="未提供PDF URL")
+    if len(urls) > 50:
+        raise HTTPException(status_code=400, detail="单次最多支持50个URL")
     
     # 创建批次ID
     batch_id = generate_id()
     logger.info(f"批次 {batch_id} 开始处理 | URL数量: {len(urls)}")
     
-    # 处理单个URL（同步返回）
-    if len(urls) == 1 and not request.callback_url:
-        result = await process_pdf_url(urls[0])
-        
-        return AuditResponse(
-            batch_id=batch_id,
-            status="completed",
-            result={
-                "total": 1,
-                "completed": 1,
-                "successful": 1 if result["status"] == "success" else 0,
-                "failed": 1 if result["status"] != "success" else 0,
-                "items": [result]
-            }
-        )
-    
-    # 处理批量请求（使用回调）
+    # 检查是否需要异步处理
     if request.callback_url:
         # 异步处理
         callback_str = convert_httpurl_to_string(request.callback_url)
@@ -405,7 +383,7 @@ async def audit_endpoint(request: AuditRequest):
             status="processing"
         )
     
-    # 处理批量请求（同步返回）
+    # 同步处理
     results = await process_batch_sync(urls)
     
     return AuditResponse(
