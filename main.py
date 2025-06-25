@@ -17,6 +17,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("PDF-Audit-API")
 
+#关键词定位截断
+SENTENCES="对其他来源资金的经费来源、资金具体开支用途做简要说明。"
+
 # 创建临时目录
 TEMP_DIR = Path("temp")
 TEMP_DIR.mkdir(exist_ok=True)
@@ -180,7 +183,14 @@ def extract_pdf_text(file_bytes: bytes, filename: str) -> str:
             f.write(text_content)
         logger.info(f"📄 已保存提取文本到临时文件: {temp_file}")
         
-        return text_content
+        #关键词处截断文本
+        match=re.search(re.escape(SENTENCES),text_content)
+        if match:
+            truncated_text=text_content[:match.end()]
+            logger.info(f"✅ 已在关键词位置截断文本，原始长度: {len(text_content)}, 截断后长度: {len(truncated_text)}")
+            return truncated_text
+        else:
+            return text_content
         
     except Exception as e:
         logger.error(f"PDF解析失败: {str(e)}")
@@ -234,23 +244,19 @@ def call_yuanbao(prompt: str) -> str:
     try:
         # 创建凭证对象
         cred = credential.Credential(SecretId, SecretKey)
-        
         # 配置HTTP参数
         httpProfile = HttpProfile()
         httpProfile.endpoint = "hunyuan.tencentcloudapi.com"
         httpProfile.reqTimeout = 1800  # 设置超时时间为180秒
-        
         # 配置客户端Profile
         clientProfile = ClientProfile()
         clientProfile.httpProfile = httpProfile
-        
         # 创建客户端
         client = hunyuan_client.HunyuanClient(cred, "ap-guangzhou", clientProfile)
-        
         # 创建请求对象
         req = models.ChatCompletionsRequest()
         params = {
-            "Model": "hunyuan-turbos-latest",
+            "Model": "hunyuan-t1-latest",
             "Messages": [
                 {
                     "Role": "user",
@@ -280,35 +286,28 @@ async def process_pdf_url(pdf_url: HttpUrl) -> dict:
     """处理单个PDF URL"""
     request_id = generate_id()
     start_time = time.time()
-    
     try:
         # 获取信号量许可（控制并发）
         async with semaphore:
             # 将HttpUrl转换为字符串
             url_str = convert_httpurl_to_string(pdf_url)
             logger.info(f"[{request_id}] 开始处理PDF: {url_str}")
-            
             # 下载PDF
             pdf_bytes = await download_pdf(url_str)
             logger.info(f"[{request_id}] PDF下载成功 | 文件大小: {len(pdf_bytes)//1024}KB")
-            
             # 提取原始文件名
             filename = extract_filename_from_url(url_str)
-            
             # 提取文本
             pdf_text = extract_pdf_text(pdf_bytes, filename)
             logger.info(f"[{request_id}] 文本提取完成 | 字符数: {len(pdf_text)}")
-            
             # 构造提示
             prompt = build_audit_prompt(pdf_text)
             logger.debug(f"[{request_id}] 提示词: {prompt[:100]}...")
-            
             # 调用模型 - 使用真实API
             logger.info(f"[{request_id}] 调用元宝API...")
             #将同步函数放入线程池窒执行
             result = await asyncio.to_thread(call_yuanbao,prompt)
-            logger.info(f"[{request_id}] 元宝API调用完成 | 结果长度: {len(result)}")
-            
+            logger.info(f"[{request_id}] 👑👑👑元宝API调用完成 | 结果长度: {len(result)}")
             return {
                 "request_id": request_id,
                 "pdf_url": url_str,
