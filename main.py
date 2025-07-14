@@ -1,9 +1,14 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os,re,io,time,uuid,json,httpx,asyncio,logging
+import sqlite3
 from pathlib import Path
+from contextlib import asynccontextmanager
 from pypdf import PdfReader
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel, HttpUrl, RootModel
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from tencentcloud.common import credential
 from tencentcloud.common.profile.client_profile import ClientProfile
 from tencentcloud.common.profile.http_profile import HttpProfile
@@ -28,7 +33,7 @@ TEMP_DIR.mkdir(exist_ok=True)
 MAX_CONCURRENT = 5
 semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-# 固定的50条审查规则
+# 固定的49条审查规则
 FIXED_AUDIT_RULES = [
     "1. 整体篇幅对比国自然同类别项目是否合适",
     "2. 全文格式是否规范（字体行距统一/标题序号匹配/空格检查）",
@@ -43,73 +48,81 @@ FIXED_AUDIT_RULES = [
     "11. 全文对于第一次出现的专业词汇是否有进行解释",
     "12. 全文是否存在过于口语化的表述",
     "13. 项目名称是否包含研究对象、研究领域、研究类型",
-    "14. 项目名称是否与神经或肿瘤药物研发有关",
+    "14. 项目名称是否与神经或肿瘤药物研发有关（一票否决）",
     "15. 项目名称是否逻辑正确，是否清晰明确",
     "16. 项目名称是否与研究内容吻合",
-    "17. 项目摘要是否在800字以内",
-    "18. 项目摘要是否包含1）研究背景+待解决的问题 2）前期结果+假说+内容 3）研究意义",
-    "19. 立项依据是否包含1）课题背景2）研究现状3）当前亟待解决的问题",
-    "20. 立项依据是否结合对应文献和前期结果",
-    "21. 立项依据部分，引用文献对应的内容是否真实",
-    "22. 参考文献是否在30-50篇之间",
-    "23. 参考文献是否保持格式统一",
-    "24. 参考文献中是否包含近5年的研究，引用近5年研究的数量是否合适",
-    "25. 立项依据部分是否有子标题，是否有下划线/加粗等标注突出重点",
-    "26. 立项依据是否附有图文",
-    "27. 立项依据部分所有文字是否超过4000字",
-    "28. 研究内容是否分阶段、分方面展示",
-    "29. 研究方案中的样本量是否合理",
-    "30. 研究方案中的样本量是否有对应的理论依据",
-    "31. 拟采取的研究方案和可行性分析是否分点分节说明",
-    "32. 是否有技术路线图",
-    "33. 技术路线图是否清晰",
-    "34. 研究内容、研究目标以及拟解决的关键科学问题部分所有文字是否超过4000字",
-    "35. 项目研究的内容在同领域中，是否已经存在很多已发表的研究成果",
-    "36. 项目是否具备转化价值",
-    "37. 项目能否解决当下该研究领域内的痛点难点",
-    "38. 项目是否有区别于其他同类研究的亮点",
-    "39. 项目研究计划是否分时间节点或分阶段展示",
-    "40. 项目产出的成果是否可衡量",
-    "41. 项目产出的成果是否有含金量",
-    "42. 项目是否可以在2年内达到预期成果",
-    "43. 申请人及团队的研究领域与课题研究方向是否匹配",
-    "44. 申请人及团队所在单位是否具备完成项目所需要的技术条件",
-    "45. 申请人团队成员组成是否合理",
-    "46. 申请人及团队的分工是否清晰，细化",
-    "47. 申请人简介中，申请人发表的文章是否标注影响因子",
-    "48. 申请人简介中，申请人发表的文章是否体现本人排序",
-    "49. 申请人简介中，申请人发表的文章是否与本项目研究内容相关",
-    "50. 项目经费预算中，参照国自然同类项目，申请人填写的是否合理"
+    "17. 项目摘要是否包含1）研究背景+待解决的问题 2）前期结果+假说+内容 3）研究意义",
+    "18. 立项依据是否包含1）课题背景2）研究现状3）当前亟待解决的问题",
+    "19. 立项依据是否结合对应文献和前期结果",
+    "20. 立项依据部分，引用文献对应的内容是否真实",
+    "21. 参考文献是否在30-50篇之间",
+    "22. 参考文献是否保持格式统一",
+    "23. 参考文献中是否包含近5年的研究，引用近5年研究的数量是否合适",
+    "24. 立项依据部分是否有子标题，是否有下划线/加粗等标注突出重点",
+    "25. 立项依据是否附有图文",
+    "26. 立项依据部分所有文字是否超过4000字",
+    "27. 研究内容是否分阶段、分方面展示",
+    "28. 研究方案中的样本量是否合理",
+    "29. 研究方案中的样本量是否有对应的理论依据",
+    "30. 拟采取的研究方案和可行性分析是否分点分节说明",
+    "31. 是否有技术路线图",
+    "32. 技术路线图是否清晰",
+    "33. 研究内容、研究目标以及拟解决的关键科学问题部分所有文字是否超过4000字",
+    "34. 项目研究的内容在同领域中，是否已经存在很多已发表的研究成果",
+    "35. 项目是否具备转化价值",
+    "36. 项目能否解决当下该研究领域内的痛点难点",
+    "37. 项目是否有区别于其他同类研究的亮点",
+    "38. 项目研究计划是否分时间节点或分阶段展示",
+    "39. 项目产出的成果是否可衡量",
+    "40. 项目产出的成果是否有含金量",
+    "41. 项目是否可以在2年内达到预期成果",
+    "42. 申请人及团队的研究领域与课题研究方向是否匹配",
+    "43. 申请人及团队所在单位是否具备完成项目所需要的技术条件",
+    "44. 申请人团队成员组成是否合理",
+    "45. 申请人及团队的分工是否清晰，细化",
+    "46. 申请人简介中，申请人发表的文章是否标注影响因子",
+    "47. 申请人简介中，申请人发表的文章是否体现本人排序",
+    "48. 申请人简介中，申请人发表的文章是否与本项目研究内容相关",
+    "49. 项目经费预算中，参照国自然同类项目，申请人填写的是否合理"
 ]
 
 # 请求模型
-class AuditRequest(BaseModel):
-    urls:List[HttpUrl]
-    callback_url: Optional[HttpUrl] = None
+class AuditItem(BaseModel):
+    url: HttpUrl
+    id: str
 
-# 响应模型
-class AuditItemResult(BaseModel):
-    request_id: str
-    pdf_url: str
-    status: str
-    processing_time: float
-    result: Optional[str] = None
-    error_message: Optional[str] = None
+class AuditRequest(RootModel):
+    root: List[AuditItem]
+    
+    def __iter__(self):
+        return iter(self.root)
+    
+    def __getitem__(self, item):
+        return self.root[item]
+    
+    def __len__(self):
+        return len(self.root)
 
-class AuditResponse(BaseModel):
-    batch_id: str
-    status: str
-    result: Optional[Dict[str, Any]] = None
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用启动时清理临时文件与缓存"""
+    logger.info("🔧 应用启动，清理旧临时文件...")
+    now = time.time()
+    for file in TEMP_DIR.glob("*.md"):
+        if file.stat().st_mtime < now - 1 * 86400:  # 1天
+            try:
+                file.unlink()
+                logger.info(f"清理旧临时文件: {file}")
+            except Exception as e:
+                logger.warning(f"清理文件失败: {file} - {str(e)}")
+    logger.info("🔧 临时文件清理完成")
 
-app = FastAPI()
+    yield  # 这里是应用运行的地方
 
-# 辅助函数
-def generate_id() -> str:
-    """生成唯一ID"""
-    return uuid.uuid4().hex[:8]
+app = FastAPI(title="内容审查", lifespan=lifespan)
 
 def convert_httpurl_to_string(url) -> str:
-    """将 HttpUrl 对象转换为字符串"""
+    """将 HttpUrl 对象安全转换为字符串，处理中文编码问题"""
     if hasattr(url, '__str__'):
         return str(url)
     elif isinstance(url, str):
@@ -126,35 +139,37 @@ def extract_filename_from_url(url: str) -> str:
     return re.sub(r'[^\w_.-]', '_', filename) or "unknown.pdf"
 
 def build_audit_prompt(pdf_text: str) -> str:
-    """构造审查提示"""
-    rule_text = "\n".join(FIXED_AUDIT_RULES)
-    
-    # 添加外部数据需求的说明
-    external_data_rules = [1, 21, 35, 36, 37, 38, 42, 50]
-    external_rule_texts = "\n".join([
-        f"规则 {num}: {FIXED_AUDIT_RULES[num-1].split('. ', 1)[1]}"
-        for num in external_data_rules
-    ])
-    extra_instruction = (
-        "\n\n注意：以下规则因为依赖外部数据，不需要根据PDF内容判断，"
-        "请直接赋值为 `TBD`，且不需要提供理由：\n"
-        f"{external_rule_texts}\n"
-    )
-    
+
+    attitude_rule_indices = [2, 3, 4, 5, 8, 9, 10, 11, 12, 14, 22]
+
+    attitude_rules_text = ", ".join([f"第{i}条" for i in attitude_rule_indices])
+    ability_rules_text = ", ".join([f"第{i}条" for i in range(1, 50) if i not in attitude_rule_indices])
+
     return f"""
-你是一个形式审查员。请根据以下50条规则，对这份PDF内容进行逐条审查。
+你是一个形式审查员。请根据以下49条规则，对这份PDF内容进行逐条审查。
 
-输出格式要求：
-- 以json形式输出；
-- 每条规则对应三列："规则内容"、"评估结果（可行/不可行/TBD）"、"理由（如有）"。
+### 输出要求：
+- 输出为json形式，每条规则对应一项，需要按照1~49顺序输出，禁止乱序；
+- 每项包含三个字段："规则内容（需带规则序号）"、"评估结果"、"理由"；
+- "评估结果"必须为：`符合`、`不符合`；
+- 如为 `不符合`，必须填写简要理由。
 
-评审规则如下：
-{rule_text}
-{extra_instruction}
+### 规则分类说明：
+- **态度类规则**共11条，编号为：{attitude_rules_text}；
+- **能力类规则**共38条，编号为：{ability_rules_text}；
+- 其中**第14条**为“一票否决”，如不合格，必须重点标注；
+- 最后请额外输出一份统计：
+  - "态度类不合格数量"（不符合计1分，括号中需要输出不符合的规则序号）；
+  - "能力类不合格数量"（不符合计1分，括号中需要输出不符合的规则序号）；
+  - 是否触发第14条一票否决（True/False）。
+
+### 评审规则如下：
+{chr(10).join(FIXED_AUDIT_RULES)}
 
 PDF内容如下：
 {pdf_text}
 """
+
 
 def extract_pdf_text(file_bytes: bytes, filename: str) -> str:
     """提取PDF文本并保存临时文件（使用原始文件名）"""
@@ -223,58 +238,67 @@ async def download_pdf(url: str) -> bytes:
                     raise ValueError(f"URL指向的文件不是PDF格式 (Content-Type: {content_type})")
                 
             # 检查文件大小
-            max_size = 50 * 1024 * 1024  # 50MB
+            max_size = 55 * 1024 * 1024  # 50MB
             if len(response.content) > max_size:
                 raise ValueError(f"PDF文件过大 (大小: {len(response.content)//1024}KB, 最大允许: {max_size//1024}KB)")
                 
             return response.content
-    except httpx.HTTPError as e:
-        logger.error(f"PDF下载失败: {str(e)}")
-        raise HTTPException(status_code=400, detail=f"PDF下载失败: {e}")
     except Exception as e:
-        logger.error(f"下载错误: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"PDF下载错误: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"PDF下载失败：{e}")
 
 # 真实的元宝API调用函数
 SecretId = os.environ.get('TENCENTCLOUD_SECRET_ID')
 SecretKey = os.environ.get('TENCENTCLOUD_SECRET_KEY')
+HUNYUAN_CLIENT=None
+import threading
+HUNYUAN_CLIENT_LOCK = threading.Lock()
 
 def call_yuanbao(prompt: str) -> str:
     """调用元宝大模型API"""
+    global HUNYUAN_CLIENT
     try:
-        # 创建凭证对象
-        cred = credential.Credential(SecretId, SecretKey)
-        # 配置HTTP参数
-        httpProfile = HttpProfile()
-        httpProfile.endpoint = "hunyuan.tencentcloudapi.com"
-        httpProfile.reqTimeout = 1800  # 设置超时时间为180秒
-        # 配置客户端Profile
-        clientProfile = ClientProfile()
-        clientProfile.httpProfile = httpProfile
-        # 创建客户端
-        client = hunyuan_client.HunyuanClient(cred, "ap-guangzhou", clientProfile)
+        #使用全局客户端（线程安全）
+        if HUNYUAN_CLIENT is None:
+            with HUNYUAN_CLIENT_LOCK:
+                if HUNYUAN_CLIENT is None:
+                    # 创建凭证对象
+                    cred = credential.Credential(SecretId, SecretKey)
+                    # 配置HTTP参数
+                    httpProfile = HttpProfile()
+                    httpProfile.endpoint = "hunyuan.tencentcloudapi.com"
+                    httpProfile.reqTimeout = 300  # 设置超时时间为300秒
+                    # 配置客户端Profile
+                    clientProfile = ClientProfile()
+                    clientProfile.httpProfile = httpProfile
+                    # 创建客户端
+                    HUNYUAN_CLIENT= hunyuan_client.HunyuanClient(
+                        cred, "ap-guangzhou", clientProfile
+                    )
         # 创建请求对象
         req = models.ChatCompletionsRequest()
-        params = {
-            "Model": "hunyuan-t1-latest",
-            "Messages": [
-                {
-                    "Role": "user",
-                    "Content": prompt
-                }
-            ],
-            "Stream": False
-        }
-        req.from_json_string(json.dumps(params))
+        req.Model="hunyuan-t1-latest"
+        req.Messages=[{"Role": "user", "Content": prompt}]
+        req.Stream=False
         
+        start_time=time.time()
         # 发送请求
-        resp = client.ChatCompletions(req)
+        resp = HUNYUAN_CLIENT.ChatCompletions(req)
+        elapsed=time.time()-start_time
+
+        #保存返回
         
-        # 返回内容
-        if hasattr(resp, 'Choices') and resp.Choices:
+
+        # 返回内容,处理响应
+        if resp and hasattr(resp, 'Choices') and resp.Choices:
+            logger.info(f"调用成功| 耗时{elapsed:.2f}")
+            with open(f"调用.txt", "a", encoding="utf-8") as f:
+                resp_dict=resp.Id
+                f.write(json.dumps(resp_dict, ensure_ascii=False) + "\n")  # 写入文件
+                f.write(json.dumps(resp.Choices[0].Message.Content, ensure_ascii=False) + "\n")
             return resp.Choices[0].Message.Content
         return "无响应内容"
-
+        
     except TencentCloudSDKException as err:
         logger.error(f"元宝API调用失败: {err}")
         return f"元宝API调用失败: {err}"
@@ -282,135 +306,195 @@ def call_yuanbao(prompt: str) -> str:
         logger.error(f"元宝调用异常: {str(e)}")
         return f"元宝调用异常: {str(e)}"
 
-async def process_pdf_url(pdf_url: HttpUrl) -> dict:
+async def process_pdf_url(pdf_url: HttpUrl, item_id: str) -> dict:
     """处理单个PDF URL"""
-    request_id = generate_id()
     start_time = time.time()
+    # 将HttpUrl转换为字符串
+    url_str = convert_httpurl_to_string(pdf_url)
     try:
         # 获取信号量许可（控制并发）
         async with semaphore:
-            # 将HttpUrl转换为字符串
-            url_str = convert_httpurl_to_string(pdf_url)
-            logger.info(f"[{request_id}] 开始处理PDF: {url_str}")
-            # 下载PDF
+            logger.info(f"[{item_id}] 开始处理PDF: {url_str}")
+            # 1.下载PDF(内存中暂存)
             pdf_bytes = await download_pdf(url_str)
-            logger.info(f"[{request_id}] PDF下载成功 | 文件大小: {len(pdf_bytes)//1024}KB")
-            # 提取原始文件名
+            logger.info(f"[{item_id}] PDF下载成功 | 文件大小: {len(pdf_bytes)//1024}KB")
+            # 2.提取原始文件名和文本
             filename = extract_filename_from_url(url_str)
-            # 提取文本
             pdf_text = extract_pdf_text(pdf_bytes, filename)
-            logger.info(f"[{request_id}] 文本提取完成 | 字符数: {len(pdf_text)}")
-            # 构造提示
+            logger.info(f"[{item_id}] 文本提取完成 | 字符数: {len(pdf_text)}")
+            #3.释放PDF二进制数据
+            del pdf_bytes
+
+            # 4.构造提示
             prompt = build_audit_prompt(pdf_text)
-            logger.debug(f"[{request_id}] 提示词: {prompt[:100]}...")
-            # 调用模型 - 使用真实API
-            logger.info(f"[{request_id}] 调用元宝API...")
-            #将同步函数放入线程池窒执行
+            logger.debug(f"[{item_id}] 提示词: {prompt[:100]}...")
+            
+            # 5.调用混元大模型
+            logger.info(f"[{item_id}] 调用元宝API...")
             result = await asyncio.to_thread(call_yuanbao,prompt)
-            logger.info(f"[{request_id}] 👑👑👑元宝API调用完成 | 结果长度: {len(result)}")
+            logger.info(f"[{item_id}] 👑👑👑元宝API调用完成 | 结果长度: {len(result)}")
+            # 6.立即释放文本数据
+            del pdf_text,prompt
+            processing_time=round(time.time() - start_time, 2)
+            
+            # 7.更新数据库中的记录
+            conn = sqlite3.connect("audit.db")
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE audit_items 
+                SET status = 'success', result = ?, error_message = NULL, processing_time = ?
+                WHERE item_id = ?
+            """, (json.dumps(result, ensure_ascii=False), processing_time, item_id))
+            conn.commit()
+            conn.close()
+
             return {
-                "request_id": request_id,
+                "item_id": item_id,
                 "pdf_url": url_str,
                 "status": "success",
-                "processing_time": time.time() - start_time,
+                "processing_time": processing_time,
                 "result": result
             }
     
     except Exception as e:
+        processing_time = time.time() - start_time
+        # 确保错误时也释放资源
+        if 'pdf_bytes' in locals(): del pdf_bytes
+        if 'pdf_text' in locals(): del pdf_text
+        conn = sqlite3.connect("audit.db")
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE audit_items 
+            SET status = 'error', result = NULL, error_message = ?, processing_time = ?
+            WHERE item_id = ?
+        """, (str(e), processing_time, item_id))
+        conn.commit()
+        conn.close()
+
         return {
-            "request_id": request_id,
-            "pdf_url": convert_httpurl_to_string(pdf_url),
+            "item_id": item_id,
+            "pdf_url": url_str,
             "status": "error",
-            "processing_time": time.time() - start_time,
+            "processing_time": processing_time,
             "error_message": str(e)
         }
 
-async def process_batch_sync(urls: List[HttpUrl]) -> List[dict]:
-    """同步批量处理"""
-    tasks = [process_pdf_url(url) for url in urls]
-    return await asyncio.gather(*tasks)
 
-async def process_batch_async(batch_id: str, urls: List[HttpUrl], callback_url: str):
-    """异步批量处理并发送回调"""
-    try:
-        logger.info(f"[{batch_id}] 开始异步批量处理 | URL数量: {len(urls)}")
-        results = await process_batch_sync(urls)
-        
-        # 准备回调数据
-        callback_data = {
-            "batch_id": batch_id,
-            "status": "completed",
-            "result": {
-                "total": len(urls),
-                "completed": len(results),
-                "successful": sum(1 for r in results if r["status"] == "success"),
-                "failed": sum(1 for r in results if r["status"] != "success"),
-                "items": results
-            }
-        }
-        
-        # 发送回调
-        async with httpx.AsyncClient() as client:
-            response = await client.post(convert_httpurl_to_string(callback_url), json=callback_data, timeout=10)
-            response.raise_for_status()
-            logger.info(f"[{batch_id}] 回调发送成功: {callback_url}")
-    
-    except Exception as e:
-        logger.error(f"[{batch_id}] 异步处理或回调失败: {str(e)}")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源，生产环境应限制为具体域名
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有HTTP方法
+    allow_headers=["*"],  # 允许所有头
+)
 
-@app.post("/audit", response_model=AuditResponse)
-async def audit_endpoint(request: AuditRequest):
-    """统一PDF审查端点"""
-    # 确定要处理的URL列表
-    urls = request.urls
-    if not urls:
-        raise HTTPException(status_code=400, detail="未提供PDF URL")
-    if len(urls) > 50:
-        raise HTTPException(status_code=400, detail="单次最多支持50个URL")
-    
-    # 创建批次ID
-    batch_id = generate_id()
-    logger.info(f"批次 {batch_id} 开始处理 | URL数量: {len(urls)}")
-    
-    # 检查是否需要异步处理
-    if request.callback_url:
-        # 异步处理
-        callback_str = convert_httpurl_to_string(request.callback_url)
-        asyncio.create_task(process_batch_async(batch_id, urls, callback_str))
-        return AuditResponse(
-            batch_id=batch_id,
-            status="processing"
+@app.get("/audit")
+async def get_audit_info():
+    return {
+        "status": "success",
+        "message": "PDF审查API正常运行",
+        "version": "1.0.0",
+        "endpoint": "/audit",
+        "supported_methods": ["GET", "POST"],
+        "usage": "POST请求需传入urls列表进行pdf审查，最多地址数量为50，最大并发为5"
+    }
+
+
+async def process_items(audit_items: List[AuditItem]):
+    """处理多个PDF项目"""
+    tasks = []
+    for item in audit_items:
+        task = asyncio.create_task(
+            process_pdf_url(item.url, item.id)
         )
-    
-    # 同步处理
-    results = await process_batch_sync(urls)
-    
-    return AuditResponse(
-        batch_id=batch_id,
-        status="completed",
-        result={
-            "total": len(urls),
-            "completed": len(results),
-            "successful": sum(1 for r in results if r["status"] == "success"),
-            "failed": sum(1 for r in results if r["status"] != "success"),
-            "items": results
-        }
-    )
+        tasks.append(task)
+    # 等待所有任务完成并返回结果
+    results = await asyncio.gather(*tasks)
+    return results
 
-@app.on_event("startup")
-async def startup_event():
-    """应用启动时清理旧临时文件"""
-    logger.info("🔧 应用启动，清理旧临时文件...")
-    now = time.time()
-    for file in TEMP_DIR.glob("*.md"):
-        if file.stat().st_mtime < now - 2 * 86400:  # 7天
-            try:
-                file.unlink()
-                logger.info(f"清理旧临时文件: {file}")
-            except Exception as e:
-                logger.warning(f"清理文件失败: {file} - {str(e)}")
-    logger.info("🔧 临时文件清理完成")
+
+@app.post("/audit")
+async def process_audit_request(audit_request: AuditRequest):
+    """处理审查请求"""
+    MAX_ITEMS_PER_BATCH = 5
+    items = list(audit_request)
+    if not items:
+        raise HTTPException(status_code=400, detail="No items provided")
+    
+    # 先将所有任务插入数据库，状态设为"processing"
+    conn = sqlite3.connect("audit.db")
+    cursor = conn.cursor()
+    current_time = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    
+    for item in items:
+        url_str = convert_httpurl_to_string(item.url)
+        cursor.execute("""
+            INSERT OR REPLACE INTO audit_items 
+            (item_id, pdf_url, status, create_time) 
+            VALUES (?, ?, 'processing', ?)
+        """, (item.id, url_str, current_time))
+    
+    conn.commit()
+    conn.close()
+    
+    # 然后异步处理这些任务
+    batches = [items[i:i + MAX_ITEMS_PER_BATCH] for i in range(0, len(items), MAX_ITEMS_PER_BATCH)]
+    tasks = []
+
+    for batch_items in batches:
+        task = asyncio.create_task(process_items(batch_items))
+        tasks.append(task)
+
+    return{"status":"success", "message": "审查任务已创建，可以通过GET /audit/{item_id}查询状态"}
+
+@app.get("/audit/{item_id}")
+def get_item_result(item_id: str):
+    """获取单个项目的处理结果"""
+    conn = sqlite3.connect("audit.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        SELECT item_id, pdf_url, status, result, error_message, processing_time, create_time
+        FROM audit_items
+        WHERE item_id = ?
+    """, (item_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Item not found")
+
+    item_id, pdf_url, status, result, error_message, processing_time, create_time = row
+    
+    return {
+        "item_id": item_id,
+        "pdf_url": pdf_url,
+        "status": status,
+        "result": json.loads(result) if result and status == "success" else None,
+        "error_message": error_message,
+        "processing_time": processing_time,
+        "create_time": create_time
+    }
+
+def init_db():
+    conn = sqlite3.connect("audit.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS audit_items (
+            item_id TEXT PRIMARY KEY,
+            pdf_url TEXT,
+            status TEXT,
+            result TEXT,
+            error_message TEXT,
+            processing_time REAL,
+            create_time TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    init_db()
+    uvicorn.run("main:app", host="0.0.0.0", port=8000,reload=True)
