@@ -6,7 +6,7 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 from pypdf import PdfReader
 from pydantic import BaseModel, HttpUrl, RootModel
-from typing import List, Optional, Dict, Any
+from typing import List
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from tencentcloud.common import credential
@@ -191,10 +191,33 @@ def extract_pdf_text(file_bytes: bytes, filename: str) -> str:
         
         # 提取PDF文本
         reader = PdfReader(io.BytesIO(file_bytes))
-        text_content = "\n".join([page.extract_text() or "" for page in reader.pages])
+        
+        # 提取文本并处理可能的编码问题
+        text_parts = []
+        for page in reader.pages:
+            page_text = page.extract_text() or ""
+            # 清理文本中的代理对字符
+            try:
+                # 优先尝试使用utf-8编码
+                encoded_text = page_text.encode('utf-8')
+                # 如果成功编码为utf-8，则不需要额外处理
+                text_parts.append(page_text)
+            except UnicodeEncodeError as utf8_error:
+                logger.warning(f"UTF-8编码失败，尝试其他编码方式: {str(utf8_error)}")
+                try:
+                    # 尝试使用utf-16编码处理代理对字符
+                    page_text = page_text.encode('utf-16', 'surrogatepass').decode('utf-16', 'replace')
+                    text_parts.append(page_text)
+                except Exception as encoding_error:
+                    logger.warning(f"UTF-16编码处理警告: {str(encoding_error)}")
+                    # 如果上述方法都失败，使用替换策略
+                    page_text = page_text.encode('utf-8', 'replace').decode('utf-8')
+                    text_parts.append(page_text)
+        
+        text_content = "\n".join(text_parts)
         
         # 保存提取的文本到临时文件
-        with open(temp_file, "w", encoding="utf-8") as f:
+        with open(temp_file, "w", encoding="utf-8", errors="ignore") as f:
             f.write(text_content)
         logger.info(f"📄 已保存提取文本到临时文件: {temp_file}")
         
@@ -277,7 +300,7 @@ def call_yuanbao(prompt: str) -> str:
                     )
         # 创建请求对象
         req = models.ChatCompletionsRequest()
-        req.Model="hunyuan-t1-latest"
+        req.Model="hunyuan-turbos-longtext-128k-20250325"
         req.Messages=[{"Role": "user", "Content": prompt}]
         req.Stream=False
         
@@ -462,7 +485,7 @@ def get_item_result(item_id: str):
     conn.close()
 
     if not row:
-        raise HTTPException(status_code=404, detail="Item not found")
+        return {"item_id": item_id, "status": "failure"}
 
     item_id, pdf_url, status, result, error_message, processing_time, create_time = row
     
@@ -497,4 +520,4 @@ def init_db():
 if __name__ == "__main__":
     import uvicorn
     init_db()
-    uvicorn.run("main:app", host="0.0.0.0", port=8000,reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8001,reload=True)
